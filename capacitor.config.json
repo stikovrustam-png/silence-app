@@ -1,0 +1,13 @@
+{
+  "appId": "app.silence.messenger",
+  "appName": "Silence",
+  "webDir": "www",
+  "backgroundColor": "#08081a",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  }
+}
