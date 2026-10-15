@@ -1,0 +1,368 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Установка зависимостей
+        run: npm install
+
+      - name: Создать Android-проект
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Плагин «Открыть с помощью»
+        run: |
+          D=android/app/src/main/java/app/silence/messenger
+          mkdir -p "$D"
+          cat > "$D/SilenceFilesPlugin.java" <<'EOF'
+          package app.silence.messenger;
+
+          import android.content.ClipData;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.util.Base64;
+
+          import androidx.core.content.FileProvider;
+
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+
+          @CapacitorPlugin(name = "SilenceFiles")
+          public class SilenceFilesPlugin extends Plugin {
+              @PluginMethod
+              public void open(PluginCall call) {
+                  try {
+                      String data = call.getString("data");
+                      String name = call.getString("name", "file");
+                      String mime = call.getString("mime", "*/*");
+                      if (data == null || data.isEmpty()) {
+                          call.reject("no data");
+                          return;
+                      }
+                      String safe = name.replaceAll("[^\\p{L}\\p{N}._ -]", "_");
+                      if (safe.isEmpty()) safe = "file";
+                      File dir = new File(getContext().getCacheDir(), "open");
+                      dir.mkdirs();
+                      File f = new File(dir, safe);
+                      byte[] bytes = Base64.decode(data, Base64.DEFAULT);
+                      FileOutputStream out = new FileOutputStream(f);
+                      out.write(bytes);
+                      out.close();
+                      Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f);
+                      Intent view = new Intent(Intent.ACTION_VIEW);
+                      view.setDataAndType(uri, mime);
+                      view.setClipData(ClipData.newRawUri("", uri));
+                      view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      Intent chooser = Intent.createChooser(view, "Открыть с помощью");
+                      chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(chooser);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+          }
+          EOF
+          cat > "$D/SilenceRecorderPlugin.java" <<'EOF'
+          package app.silence.messenger;
+
+          import android.Manifest;
+          import android.media.MediaRecorder;
+          import android.os.Build;
+          import android.util.Base64;
+
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+
+          @CapacitorPlugin(
+              name = "SilenceRecorder",
+              permissions = { @Permission(strings = { Manifest.permission.RECORD_AUDIO }, alias = "mic") }
+          )
+          public class SilenceRecorderPlugin extends Plugin {
+              private MediaRecorder rec;
+              private File file;
+              private long t0;
+
+              @PluginMethod
+              public void start(PluginCall call) {
+                  if (getPermissionState("mic") != PermissionState.GRANTED) {
+                      requestPermissionForAlias("mic", call, "micPerm");
+                      return;
+                  }
+                  doStart(call);
+              }
+
+              @PermissionCallback
+              private void micPerm(PluginCall call) {
+                  JSObject r = new JSObject();
+                  r.put("started", false);
+                  if (getPermissionState("mic") == PermissionState.GRANTED) r.put("granted", true);
+                  else r.put("denied", true);
+                  call.resolve(r);
+              }
+
+              private void doStart(PluginCall call) {
+                  JSObject r = new JSObject();
+                  try {
+                      release();
+                      File dir = new File(getContext().getCacheDir(), "rec");
+                      dir.mkdirs();
+                      file = new File(dir, "voice.m4a");
+                      if (file.exists()) file.delete();
+                      rec = Build.VERSION.SDK_INT >= 31 ? new MediaRecorder(getContext()) : new MediaRecorder();
+                      rec.setAudioSource(MediaRecorder.AudioSource.MIC);
+                      rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                      rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                      rec.setAudioChannels(1);
+                      rec.setAudioSamplingRate(44100);
+                      rec.setAudioEncodingBitRate(48000);
+                      rec.setOutputFile(file.getAbsolutePath());
+                      rec.prepare();
+                      rec.start();
+                      t0 = System.currentTimeMillis();
+                      r.put("started", true);
+                      call.resolve(r);
+                  } catch (Exception e) {
+                      release();
+                      r.put("started", false);
+                      r.put("error", String.valueOf(e.getMessage()));
+                      call.resolve(r);
+                  }
+              }
+
+              @PluginMethod
+              public void askMic(PluginCall call) {
+                  if (getPermissionState("mic") == PermissionState.GRANTED) {
+                      JSObject r = new JSObject();
+                      r.put("granted", true);
+                      call.resolve(r);
+                      return;
+                  }
+                  requestPermissionForAlias("mic", call, "micAsked");
+              }
+
+              @PermissionCallback
+              private void micAsked(PluginCall call) {
+                  JSObject r = new JSObject();
+                  r.put("granted", getPermissionState("mic") == PermissionState.GRANTED);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void level(PluginCall call) {
+                  JSObject r = new JSObject();
+                  int a = 0;
+                  try { if (rec != null) a = rec.getMaxAmplitude(); } catch (Exception e) { }
+                  r.put("amp", a);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void stop(PluginCall call) {
+                  try {
+                      if (rec == null) { call.reject("not recording"); return; }
+                      long dur = System.currentTimeMillis() - t0;
+                      rec.stop();
+                      release();
+                      FileInputStream in = new FileInputStream(file);
+                      ByteArrayOutputStream out = new ByteArrayOutputStream();
+                      byte[] buf = new byte[16384];
+                      int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                      in.close();
+                      file.delete();
+                      JSObject r = new JSObject();
+                      r.put("data", Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP));
+                      r.put("dur", dur);
+                      call.resolve(r);
+                  } catch (Exception e) {
+                      release();
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+
+              @PluginMethod
+              public void cancel(PluginCall call) {
+                  try {
+                      if (rec != null) { try { rec.stop(); } catch (Exception e) { } }
+                  } finally {
+                      release();
+                      if (file != null) file.delete();
+                      call.resolve();
+                  }
+              }
+
+              private void release() {
+                  if (rec != null) {
+                      try { rec.release(); } catch (Exception e) { }
+                      rec = null;
+                  }
+              }
+
+              @Override
+              protected void handleOnDestroy() {
+                  release();
+              }
+          }
+          EOF
+          cat > "$D/MainActivity.java" <<'EOF'
+          package app.silence.messenger;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(SilenceFilesPlugin.class);
+                  registerPlugin(SilenceRecorderPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          EOF
+
+      - name: Уведомления (нативная часть)
+        run: |
+          D=android/app/src/main/java/app/silence/messenger
+          cp native/*.java "$D"/
+          cp -r res-extra/. android/app/src/main/res/
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          perms = ['POST_NOTIFICATIONS', 'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_SPECIAL_USE', 'FOREGROUND_SERVICE_MEDIA_PLAYBACK',
+                   'RECEIVE_BOOT_COMPLETED', 'WAKE_LOCK',
+                   'USE_FULL_SCREEN_INTENT', 'VIBRATE',
+                   'READ_MEDIA_IMAGES', 'READ_MEDIA_VIDEO', 'READ_MEDIA_AUDIO',
+                   'READ_EXTERNAL_STORAGE', 'MANAGE_EXTERNAL_STORAGE', 'WRITE_EXTERNAL_STORAGE']
+          add = ''.join('<uses-permission android:name="android.permission.%s" />\n    ' % x
+                        for x in perms if 'android.permission.%s"' % x not in s)
+          if add:
+              s = s.replace('<application', add + '<application', 1)
+          if 'NotifyService' not in s:
+              comp = (
+                  '<service android:name=".NotifyService" android:exported="false" '
+                  'android:foregroundServiceType="specialUse">'
+                  '<property android:name="android.app.PROPERTY_SPECIAL_USE_FOREGROUND_SERVICE_SUBTYPE" '
+                  'android:value="messenger_sync" /></service>\n        '
+                  '<receiver android:name=".BootReceiver" android:exported="true">'
+                  '<intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" />'
+                  '<action android:name="android.intent.action.MY_PACKAGE_REPLACED" /></intent-filter></receiver>\n    ')
+              s = s.replace('</application>', comp + '</application>', 1)
+          if 'SilenceMediaService' not in s:
+              s = s.replace('</application>', '<service android:name=".SilenceMediaService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n    </application>', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          grep -c SilenceMediaService android/app/src/main/AndroidManifest.xml
+          grep -c NotifyService android/app/src/main/AndroidManifest.xml
+
+      - name: Firebase (push-уведомления)
+        run: |
+          if [ -f google-services.json ]; then
+            cp google-services.json android/app/google-services.json
+          else
+            echo "::warning::google-services.json не найден: push работать не будет, останется фоновая служба"
+          fi
+          python3 - <<'PY'
+          import re
+          p = 'android/app/build.gradle'
+          s = open(p, encoding='utf-8').read()
+          if 'firebase-messaging' not in s:
+              s = re.sub(r'dependencies\s*\{', "dependencies {\n    implementation 'com.google.firebase:firebase-messaging:24.1.0'", s, count=1)
+          if 'com.google.gms.google-services' not in s:
+              s += "\napply plugin: 'com.google.gms.google-services'\n"
+          open(p, 'w', encoding='utf-8').write(s)
+          p = 'android/build.gradle'
+          s = open(p, encoding='utf-8').read()
+          if 'com.google.gms:google-services' not in s:
+              s = re.sub(r"(classpath\s+['\"]com\.android\.tools\.build:gradle:[^'\"]+['\"])",
+                         r"\1\n        classpath 'com.google.gms:google-services:4.4.2'", s, count=1)
+          open(p, 'w', encoding='utf-8').write(s)
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          if 'SilenceFcmService' not in s:
+              svc = ('<service android:name=".SilenceFcmService" android:exported="false">'
+                     '<intent-filter><action android:name="com.google.firebase.MESSAGING_EVENT" /></intent-filter>'
+                     '</service>\n    ')
+              s = s.replace('</application>', svc + '</application>', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          grep -c SilenceFcmService android/app/src/main/AndroidManifest.xml
+          grep -n "firebase-messaging\|google-services" android/app/build.gradle android/build.gradle
+
+      - name: Иконка приложения
+        run: npx --yes @capacitor/assets@3.0.5 generate --android
+
+      - name: Разрешить http-запросы к серверу
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q usesCleartextTraffic "$M" || sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$M"
+
+      - name: Разрешения (микрофон)
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q RECORD_AUDIO "$M" || sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <application#' "$M"
+
+      - name: Номер версии = номер сборки
+        run: sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/" android/app/build.gradle
+
+      - name: Постоянный ключ подписи
+        run: |
+          mkdir -p ~/.android
+          cp debug.keystore ~/.android/debug.keystore
+
+      - name: Сборка APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Переименовать APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk Silence.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Silence-apk
+          path: Silence.apk
+
+      - name: Выложить в Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Silence build ${{ github.run_number }}
+          files: Silence.apk
