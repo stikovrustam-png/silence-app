@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "725904986067",
+    "project_id": "message-need",
+    "storage_bucket": "message-need.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:725904986067:android:ff5b57356f9bc89620a926",
+        "android_client_info": {
+          "package_name": "app.silence.messenger"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDw1zPn2yxGu4nJgUxDdE6x6LBIy9X-saE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
